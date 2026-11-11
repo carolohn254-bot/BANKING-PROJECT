@@ -1,0 +1,453 @@
+
+
+################################################################
+# FILE: index.php
+################################################################
+<?php
+require_once __DIR__ . '/includes/auth.php';
+$u = current_user();
+if ($u) redirect($u['role'] === 'admin' ? 'admin/dashboard.php' : 'customer/dashboard.php');
+$error = null;
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    csrf_check();
+    $username = trim($_POST['username'] ?? ''); $pw = $_POST['password'] ?? '';
+    if ($username === '' || $pw === '') $error = 'Enter your username and password or PIN.';
+    else { $error = attempt_login($username, $pw); if (!$error) redirect('index.php'); }
+}
+$f = flash();
+?><!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login - Mobile Banking Notifications</title><link rel="stylesheet" href="assets/style.css"></head><body>
+<div class="login"><div class="logo">&#9679; Real-Time Mobile Banking</div>
+<div class="card"><h2>Log in</h2>
+<?php if ($error): ?><div class="msg err"><?= e($error) ?></div><?php endif; ?>
+<?php if ($f): ?><div class="msg <?= e($f[1]) ?>"><?= e($f[0]) ?></div><?php endif; ?>
+<form method="post" autocomplete="off"><?= csrf_field() ?>
+<label for="username">Username</label><input id="username" name="username" required maxlength="50" autofocus>
+<label for="password">Password or PIN</label><input id="password" name="password" type="password" required>
+<div class="btns"><button class="btn" style="width:100%">Log in</button></div></form>
+<div class="demo"><b>Demo accounts (simulated data):</b><br>Customer: john / 1234 &middot; mary / 2345 &middot; peter / 3456<br>Administrator: admin / admin123<br>Suspended: sam / 4567</div>
+</div></div></body></html>
+
+
+################################################################
+# FILE: logout.php
+################################################################
+<?php
+require_once __DIR__ . '/includes/auth.php';
+do_logout(); session_start(); flash('You have been logged out.'); redirect('index.php');
+
+
+################################################################
+# FILE: customer/complaint.php
+################################################################
+<?php
+require_once __DIR__ . '/../includes/auth.php'; require_once __DIR__ . '/../includes/layout.php';
+$u = require_role('customer'); $pdo = db();
+$tx = $pdo->prepare('SELECT t.transaction_id, t.transaction_ref, t.type, t.amount, t.created_at FROM transactions t JOIN accounts a ON a.account_id=t.account_id WHERE a.user_id=? ORDER BY t.transaction_id DESC LIMIT 30'); $tx->execute([$u['user_id']]); $txs = $tx->fetchAll();
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    csrf_check(); $tid = (int)($_POST['transaction_id'] ?? 0); $issue = $_POST['issue_type'] ?? ''; $d = trim($_POST['description'] ?? '');
+    $mine = array_column($txs, 'transaction_id');
+    if (!in_array($issue, ['missing', 'delayed', 'duplicate', 'incorrect'])) flash('Choose the type of problem.', 'err');
+    elseif ($tid && !in_array($tid, array_map('intval', $mine))) flash('Choose one of your own transactions.', 'err');
+    elseif (mb_strlen($d) < 5 || mb_strlen($d) > 1000) flash('Describe the problem (5 to 1000 characters).', 'err');
+    else { $pdo->prepare("INSERT INTO complaints (user_id, transaction_id, issue_type, description, status, created_at) VALUES (?,?,?,?, 'open', ?)")->execute([$u['user_id'], $tid ?: null, $issue, $d, now()]); audit($u['user_id'], 'COMPLAINT', "Issue: $issue"); flash('Your complaint has been sent to the bank. We will respond soon.'); }
+    redirect('customer/complaint.php');
+}
+$my = $pdo->prepare('SELECT * FROM complaints WHERE user_id=? ORDER BY complaint_id DESC'); $my->execute([$u['user_id']]);
+page_start('Report a notification problem', 'customer', 'complaint'); ?>
+<div class="two"><div class="card"><form method="post"><?= csrf_field() ?>
+<label>Transaction concerned</label><select name="transaction_id"><option value="0">- not sure / none -</option><?php foreach ($txs as $t) echo '<option value="' . $t['transaction_id'] . '"' . (($_GET['tx'] ?? '') == $t['transaction_id'] ? ' selected' : '') . '>' . e($t['transaction_ref'] . ' - ' . ucfirst($t['type']) . ' ' . number_format($t['amount'], 2)) . '</option>'; ?></select>
+<label>Type of problem</label><select name="issue_type"><option value="missing">Missing notification</option><option value="delayed">Delayed notification</option><option value="duplicate">Duplicate notification</option><option value="incorrect">Incorrect balance</option></select>
+<label>Describe the problem</label><textarea name="description" rows="4" required maxlength="1000"></textarea>
+<div class="btns"><button class="btn">Submit complaint</button></div></form></div>
+<div class="card"><h2>My complaints</h2><?php $any = false; foreach ($my as $c): $any = true; ?><div style="border-bottom:1px solid var(--line);padding:8px 0"><b><?= e(ucfirst($c['issue_type'])) ?></b> <?= badge($c['status']) ?><br><span class="small"><?= e($c['description']) ?></span>
+<?php if ($c['admin_response']): ?><div class="sms small" style="margin-top:6px"><b>Bank response:</b> <?= e($c['admin_response']) ?></div><?php endif; ?></div><?php endforeach; if (!$any) echo '<p class="muted">None yet.</p>'; ?></div></div>
+<?php page_end('customer');
+
+
+################################################################
+# FILE: customer/dashboard.php
+################################################################
+<?php
+require_once __DIR__ . '/../includes/auth.php'; require_once __DIR__ . '/../includes/layout.php';
+$u = require_role('customer'); $pdo = db();
+$a = $pdo->prepare('SELECT * FROM accounts WHERE user_id=?'); $a->execute([$u['user_id']]); $acc = $a->fetch();
+$tx = $pdo->prepare('SELECT * FROM transactions WHERE account_id=? ORDER BY transaction_id DESC LIMIT 5'); $tx->execute([$acc['account_id']]);
+$nt = $pdo->prepare('SELECT n.*, t.transaction_ref FROM notifications n JOIN transactions t ON t.transaction_id=n.transaction_id WHERE t.account_id=? ORDER BY n.notification_id DESC LIMIT 4'); $nt->execute([$acc['account_id']]);
+page_start('Dashboard', 'customer', 'dashboard'); ?>
+<div class="balance"><div class="l"><span class="live"></span>Current balance (updates live)</div><div class="v" id="bal"><?= e(money($acc['balance'])) ?></div><div class="a">Account <?= e(mask_account($acc['account_number'])) ?> &middot; <?= e($u['full_name']) ?></div></div>
+<div class="btns" style="margin-bottom:18px"><a class="btn" href="transact.php?type=deposit">Deposit</a><a class="btn" href="transact.php?type=withdrawal">Withdraw</a><a class="btn" href="transact.php?type=transfer">Transfer</a></div>
+<div class="two"><div class="card"><h2>Recent transactions</h2><div class="tw"><table><tr><th>Date</th><th>Type</th><th class="right">Amount</th><th class="right">Balance</th></tr>
+<?php foreach ($tx as $t): ?><tr><td><?= e(date('d M H:i', strtotime($t['created_at']))) ?></td><td><?= e(ucfirst($t['type'])) ?> <?= badge($t['direction']) ?></td><td class="right"><?= e(number_format($t['amount'], 2)) ?></td><td class="right"><?= e(number_format($t['balance_after'], 2)) ?></td></tr>
+<?php endforeach; if (!$tx->rowCount() && !isset($t)) echo '<tr><td colspan="4" class="muted">No transactions yet.</td></tr>'; ?></table></div></div>
+<div class="card"><h2>Latest notifications</h2>
+<?php $any = false; foreach ($nt as $n): $any = true; ?><div class="sms" style="margin-bottom:8px"><?= e($n['message']) ?><br><span class="small muted"><?= e($n['channel']) ?> &middot; <?= badge($n['status']) ?></span></div>
+<?php endforeach; if (!$any) echo '<p class="muted">No notifications yet.</p>'; ?>
+<a href="notifications.php" class="small">View all &rarr;</a></div></div>
+<script>
+// "Real-time": poll the balance every 4 seconds so the page reflects changes (e.g. an incoming transfer) without a refresh.
+setInterval(function(){fetch('../api/balance.php',{credentials:'same-origin'}).then(r=>r.ok?r.json():null).then(d=>{if(d)document.getElementById('bal').textContent=d.balance}).catch(()=>{})},4000);
+</script>
+<?php page_end('customer');
+
+
+################################################################
+# FILE: customer/history.php
+################################################################
+<?php
+require_once __DIR__ . '/../includes/auth.php'; require_once __DIR__ . '/../includes/layout.php';
+$u = require_role('customer'); $pdo = db();
+$a = $pdo->prepare('SELECT account_id FROM accounts WHERE user_id=?'); $a->execute([$u['user_id']]); $aid = (int)$a->fetchColumn();
+$from = $_GET['from'] ?? ''; $to = $_GET['to'] ?? ''; $type = $_GET['type'] ?? '';
+$w = 'account_id=?'; $p = [$aid];
+if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $from)) { $w .= ' AND created_at>=?'; $p[] = "$from 00:00:00"; }
+if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $to)) { $w .= ' AND created_at<=?'; $p[] = "$to 23:59:59"; }
+if (in_array($type, ['deposit', 'withdrawal', 'transfer'])) { $w .= ' AND type=?'; $p[] = $type; }
+$per = 10; $page = max(1, (int)($_GET['p'] ?? 1));
+$c = $pdo->prepare("SELECT COUNT(*) FROM transactions WHERE $w"); $c->execute($p); $total = (int)$c->fetchColumn(); $pages = max(1, (int)ceil($total / $per));
+$st = $pdo->prepare("SELECT * FROM transactions WHERE $w ORDER BY transaction_id DESC LIMIT $per OFFSET " . (($page - 1) * $per)); $st->execute($p);
+page_start('Transaction history', 'customer', 'history'); ?>
+<div class="card"><form class="filters"><div><label>From</label><input type="date" name="from" value="<?= e($from) ?>"></div><div><label>To</label><input type="date" name="to" value="<?= e($to) ?>"></div>
+<div><label>Type</label><select name="type"><option value="">All</option><?php foreach (['deposit','withdrawal','transfer'] as $t) echo '<option value="' . $t . '"' . ($t === $type ? ' selected' : '') . '>' . ucfirst($t) . '</option>'; ?></select></div><div><button class="btn">Filter</button></div></form>
+<div class="tw"><table><tr><th>Date &amp; time</th><th>Reference</th><th>Type</th><th class="right">Amount</th><th class="right">Balance after</th></tr>
+<?php foreach ($st as $t): ?><tr><td><?= e($t['created_at']) ?></td><td class="small"><?= e($t['transaction_ref']) ?></td><td><?= e(ucfirst($t['type'])) ?> <?= badge($t['direction']) ?></td><td class="right"><?= e(number_format($t['amount'], 2)) ?></td><td class="right"><?= e(number_format($t['balance_after'], 2)) ?></td></tr>
+<?php endforeach; if (!$total) echo '<tr><td colspan="5" class="muted">No transactions match.</td></tr>'; ?></table></div>
+<?= pager($page, $pages, ['from' => $from, 'to' => $to, 'type' => $type]) ?></div>
+<?php page_end('customer');
+
+
+################################################################
+# FILE: customer/notifications.php
+################################################################
+<?php
+require_once __DIR__ . '/../includes/auth.php'; require_once __DIR__ . '/../includes/layout.php';
+$u = require_role('customer');
+$st = db()->prepare('SELECT n.*, t.transaction_ref FROM notifications n JOIN transactions t ON t.transaction_id=n.transaction_id JOIN accounts a ON a.account_id=t.account_id WHERE a.user_id=? ORDER BY n.notification_id DESC LIMIT 100'); $st->execute([$u['user_id']]);
+page_start('Notification history', 'customer', 'notifications'); ?>
+<div class="card"><div class="tw"><table><tr><th>Sent</th><th>Message</th><th>Channel</th><th>Status</th></tr>
+<?php $any = false; foreach ($st as $n): $any = true; ?><tr><td class="small"><?= e($n['sent_at'] ?: '-') ?></td><td><?= e($n['message']) ?></td><td><?= e($n['channel']) ?></td><td><?= badge($n['status']) ?></td></tr>
+<?php endforeach; if (!$any) echo '<tr><td colspan="4" class="muted">No notifications yet.</td></tr>'; ?></table></div>
+<p class="small">Missing, late, repeated or wrong message? <a class="btn sm sec" href="complaint.php">Report a problem</a></p></div>
+<?php page_end('customer');
+
+
+################################################################
+# FILE: customer/settings.php
+################################################################
+<?php
+require_once __DIR__ . '/../includes/auth.php'; require_once __DIR__ . '/../includes/layout.php';
+$u = require_role('customer'); $pdo = db();
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    csrf_check(); $pref = $_POST['pref'] ?? ''; $ph = trim($_POST['phone'] ?? '');
+    if (!in_array($pref, ['sms', 'push', 'both'])) flash('Choose how you want to receive alerts.', 'err');
+    elseif (!valid_phone($ph)) flash('Enter a valid Kenyan mobile number, e.g. 0712345678.', 'err');
+    else { $pdo->prepare('UPDATE users SET notify_preference=?, phone_number=? WHERE user_id=?')->execute([$pref, normalise_phone($ph), $u['user_id']]); audit($u['user_id'], 'SETTINGS', "Notifications: $pref"); flash('Settings saved. They will be used for your next notification.'); }
+    redirect('customer/settings.php');
+}
+$r = $pdo->prepare('SELECT * FROM users WHERE user_id=?'); $r->execute([$u['user_id']]); $me = $r->fetch();
+page_start('Notification settings', 'customer', 'settings'); ?>
+<div class="two"><div class="card"><form method="post"><?= csrf_field() ?>
+<label>Receive alerts by</label><select name="pref"><?php foreach (['sms' => 'SMS', 'push' => 'Push notification', 'both' => 'SMS and push'] as $k => $v) echo '<option value="' . $k . '"' . ($k === $me['notify_preference'] ? ' selected' : '') . '>' . $v . '</option>'; ?></select>
+<label>Phone number for SMS</label><input name="phone" value="<?= e($me['phone_number']) ?>" required>
+<div class="btns"><button class="btn">Save settings</button></div></form></div>
+<div class="card"><h2>Sample message</h2><div class="sms">Deposit of KES 5,000.00 to a/c ****0001 on 13/10/26 12:30. New balance KES 30,000.00. Ref TXN20261013123000AB12CD.</div><p class="small muted">This is what a notification looks like.</p></div></div>
+<?php page_end('customer');
+
+
+################################################################
+# FILE: customer/transact.php
+################################################################
+<?php
+require_once __DIR__ . '/../includes/auth.php'; require_once __DIR__ . '/../includes/layout.php'; require_once __DIR__ . '/../includes/transaction.php';
+$u = require_role('customer');
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    csrf_check();
+    [$ok, $m] = process_transaction($u['user_id'], $_POST['type'] ?? '', $_POST['amount'] ?? '', $_POST['ref'] ?? '', $_POST['pin'] ?? '', $_POST['to_account'] ?? '');
+    flash($m, $ok ? 'ok' : 'err');
+    redirect($ok ? 'customer/dashboard.php' : 'customer/transact.php');   // redirect so a page refresh cannot re-submit
+}
+$type = in_array($_GET['type'] ?? '', ['deposit', 'withdrawal', 'transfer']) ? $_GET['type'] : 'deposit';
+$ref = new_transaction_ref();
+page_start('Make a transaction', 'customer', 'transact'); ?>
+<div class="card" style="max-width:520px"><form method="post" autocomplete="off"><?= csrf_field() ?><input type="hidden" name="ref" value="<?= e($ref) ?>">
+<label>Transaction type</label><select name="type" id="type"><?php foreach (['deposit','withdrawal','transfer'] as $t) echo '<option value="' . $t . '"' . ($t === $type ? ' selected' : '') . '>' . ucfirst($t) . '</option>'; ?></select>
+<div id="toBox"><label>Receiving account number</label><input name="to_account" inputmode="numeric" maxlength="20" placeholder="e.g. 0100000002"></div>
+<label>Amount (KES)</label><input name="amount" required inputmode="decimal" placeholder="0.00">
+<label>Confirm with your PIN</label><input name="pin" type="password" required>
+<p class="small muted">After the transaction your new balance is sent to you as a notification.</p>
+<div class="btns"><button class="btn" id="go">Confirm transaction</button><a class="btn sec" href="dashboard.php">Cancel</a></div></form></div>
+<script>
+var t=document.getElementById('type'),b=document.getElementById('toBox');function s(){b.style.display=t.value==='transfer'?'block':'none'}t.onchange=s;s();
+document.querySelector('form').addEventListener('submit',function(){var g=document.getElementById('go');setTimeout(function(){g.disabled=true;g.textContent='Processing...'},0)});
+</script>
+<?php page_end('customer');
+
+
+################################################################
+# FILE: admin/complaints.php
+################################################################
+<?php
+require_once __DIR__ . '/../includes/auth.php'; require_once __DIR__ . '/../includes/layout.php';
+$u = require_role('admin'); $pdo = db();
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    csrf_check(); $id = (int)$_POST['id']; $s = $_POST['status'] ?? ''; $r = trim($_POST['response'] ?? '');
+    if (!in_array($s, ['open', 'in_progress', 'resolved'])) flash('Invalid status.', 'err');
+    elseif ($s === 'resolved' && $r === '') flash('Write a response before resolving.', 'err');
+    else { $pdo->prepare('UPDATE complaints SET status=?, admin_response=? WHERE complaint_id=?')->execute([$s, $r !== '' ? $r : null, $id]); audit($u['user_id'], 'COMPLAINT_UPDATED', "Complaint #$id -> $s"); flash('Complaint updated.'); }
+    redirect('admin/complaints.php?id=' . $id);
+}
+$all = $pdo->query('SELECT c.*, us.full_name FROM complaints c JOIN users us ON us.user_id=c.user_id ORDER BY c.complaint_id DESC')->fetchAll();
+$sel = null; $id = (int)($_GET['id'] ?? ($all[0]['complaint_id'] ?? 0)); foreach ($all as $c) if ($c['complaint_id'] == $id) $sel = $c;
+$tx = null; if ($sel && $sel['transaction_id']) { $s = $pdo->prepare('SELECT t.*, n.message, n.status ns FROM transactions t LEFT JOIN notifications n ON n.transaction_id=t.transaction_id WHERE t.transaction_id=?'); $s->execute([$sel['transaction_id']]); $tx = $s->fetch(); }
+page_start('Notification complaints', 'admin', 'complaints'); ?>
+<div class="two"><div class="card"><h2>Complaints</h2><?php foreach ($all as $c) echo '<p style="margin:0;padding:8px 0;border-bottom:1px solid var(--line)"><a href="?id=' . $c['complaint_id'] . '">#' . $c['complaint_id'] . ' ' . e($c['full_name']) . ' - ' . e($c['issue_type']) . '</a> ' . badge($c['status']) . '</p>'; if (!$all) echo '<p class="muted">No complaints.</p>'; ?></div>
+<div class="card"><?php if ($sel): ?><h2>Complaint #<?= $sel['complaint_id'] ?> <?= badge($sel['status']) ?></h2><p class="small muted"><?= e($sel['full_name']) ?> &middot; <?= e($sel['created_at']) ?> &middot; <?= e(ucfirst($sel['issue_type'])) ?></p><p><?= e($sel['description']) ?></p>
+<?php if ($tx): ?><div class="sms small"><b><?= e($tx['transaction_ref']) ?></b> (<?= e($tx['type']) ?>, <?= e(number_format($tx['amount'], 2)) ?>)<br>Notification: <?= $tx['ns'] ? badge($tx['ns']) . ' ' . e($tx['message']) : 'none recorded' ?></div><?php endif; ?>
+<form method="post"><?= csrf_field() ?><input type="hidden" name="id" value="<?= $sel['complaint_id'] ?>"><label>Response to customer</label><textarea name="response" rows="3" maxlength="1000"><?= e($sel['admin_response']) ?></textarea>
+<label>Status</label><select name="status"><?php foreach (['open', 'in_progress', 'resolved'] as $s) echo '<option value="' . $s . '"' . ($s === $sel['status'] ? ' selected' : '') . '>' . ucfirst(str_replace('_', ' ', $s)) . '</option>'; ?></select><div class="btns"><button class="btn">Save</button></div></form>
+<?php else: echo '<p class="muted">Select a complaint.</p>'; endif; ?></div></div>
+<?php page_end('admin');
+
+
+################################################################
+# FILE: admin/customers.php
+################################################################
+<?php
+require_once __DIR__ . '/../includes/auth.php'; require_once __DIR__ . '/../includes/layout.php';
+$u = require_role('admin'); $pdo = db();
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    csrf_check(); $act = $_POST['action'] ?? '';
+    if ($act === 'toggle') {
+        $id = (int)$_POST['user_id']; $s = $pdo->prepare("SELECT status FROM users WHERE user_id=? AND role='customer'"); $s->execute([$id]); $cur = $s->fetchColumn();
+        if ($cur) { $new = $cur === 'active' ? 'suspended' : 'active'; $pdo->prepare('UPDATE users SET status=? WHERE user_id=?')->execute([$new, $id]); audit($u['user_id'], 'CUSTOMER_' . strtoupper($new), "User #$id"); flash("Customer is now $new."); }
+    } elseif ($act === 'add' || $act === 'edit') {
+        $name = trim($_POST['full_name'] ?? ''); $ph = trim($_POST['phone'] ?? ''); $un = trim($_POST['username'] ?? ''); $pin = $_POST['pin'] ?? '';
+        $err = null;
+        if ($name === '' || mb_strlen($name) > 100) $err = 'Enter the full name.';
+        elseif (!valid_phone($ph)) $err = 'Enter a valid Kenyan phone number.';
+        elseif ($act === 'add' && (!preg_match('/^[a-z0-9_]{3,30}$/', $un) || !preg_match('/^\d{4,6}$/', $pin))) $err = 'Username: 3-30 lowercase letters/digits. PIN: 4-6 digits.';
+        elseif ($act === 'edit' && $pin !== '' && !preg_match('/^\d{4,6}$/', $pin)) $err = 'PIN must be 4-6 digits.';
+        if ($err) flash($err, 'err');
+        elseif ($act === 'add') {
+            try {
+                $pdo->beginTransaction();
+                $pdo->prepare("INSERT INTO users (username, full_name, phone_number, password_hash, role, notify_preference, status) VALUES (?,?,?,?, 'customer', 'sms', 'active')")->execute([$un, $name, normalise_phone($ph), password_hash($pin, PASSWORD_DEFAULT)]);
+                $uid = (int)$pdo->lastInsertId(); $accno = '01' . str_pad((string)(10000000 + $uid), 8, '0', STR_PAD_LEFT);
+                $pdo->prepare('INSERT INTO accounts (user_id, account_number, balance) VALUES (?,?,0)')->execute([$uid, $accno]); $pdo->commit();
+                audit($u['user_id'], 'CUSTOMER_ADDED', "$un, account $accno"); flash("Customer added. Account number $accno.");
+            } catch (PDOException $e) { $pdo->rollBack(); flash('That username already exists.', 'err'); }
+        } else {
+            $id = (int)$_POST['user_id'];
+            $pdo->prepare("UPDATE users SET full_name=?, phone_number=? WHERE user_id=? AND role='customer'")->execute([$name, normalise_phone($ph), $id]);
+            if ($pin !== '') $pdo->prepare("UPDATE users SET password_hash=? WHERE user_id=? AND role='customer'")->execute([password_hash($pin, PASSWORD_DEFAULT), $id]);
+            audit($u['user_id'], 'CUSTOMER_EDITED', "User #$id"); flash('Customer updated.');
+        }
+    }
+    redirect('admin/customers.php');
+}
+$search = trim($_GET['q'] ?? ''); $edit = (int)($_GET['edit'] ?? 0);
+$st = $pdo->prepare("SELECT u.*, a.account_number, a.balance FROM users u LEFT JOIN accounts a ON a.user_id=u.user_id WHERE u.role='customer' AND (u.full_name LIKE ? OR u.username LIKE ? OR a.account_number LIKE ?) ORDER BY u.user_id"); $l = "%$search%"; $st->execute([$l, $l, $l]); $rows = $st->fetchAll();
+$ed = null; foreach ($rows as $r) if ($r['user_id'] == $edit) $ed = $r;
+page_start('Manage customers', 'admin', 'customers'); ?>
+<div class="card"><form class="filters"><div style="flex:3"><label>Search</label><input name="q" value="<?= e($search) ?>" placeholder="Name, username or account number"></div><div><button class="btn">Search</button></div></form>
+<div class="tw"><table><tr><th>Name</th><th>Username</th><th>Account</th><th class="right">Balance</th><th>Phone</th><th>Status</th><th></th></tr>
+<?php foreach ($rows as $r): ?><tr><td><?= e($r['full_name']) ?></td><td><?= e($r['username']) ?></td><td><?= e($r['account_number']) ?></td><td class="right"><?= e(number_format($r['balance'], 2)) ?></td><td><?= e($r['phone_number']) ?></td><td><?= badge($r['status']) ?></td>
+<td><a class="btn sm sec" href="?edit=<?= $r['user_id'] ?>">Edit</a> <form method="post" style="display:inline"><?= csrf_field() ?><input type="hidden" name="action" value="toggle"><input type="hidden" name="user_id" value="<?= $r['user_id'] ?>"><button class="btn sm <?= $r['status'] === 'active' ? 'danger' : '' ?>"><?= $r['status'] === 'active' ? 'Suspend' : 'Activate' ?></button></form></td></tr><?php endforeach; ?></table></div></div>
+<div class="card" style="max-width:560px"><h2><?= $ed ? 'Edit customer' : 'Add customer' ?></h2><form method="post"><?= csrf_field() ?><input type="hidden" name="action" value="<?= $ed ? 'edit' : 'add' ?>"><?php if ($ed) echo '<input type="hidden" name="user_id" value="' . $ed['user_id'] . '">'; ?>
+<label>Full name</label><input name="full_name" required value="<?= e($ed['full_name'] ?? '') ?>"><label>Phone</label><input name="phone" required value="<?= e($ed['phone_number'] ?? '') ?>" placeholder="0712345678">
+<?php if (!$ed): ?><label>Username</label><input name="username" required placeholder="lowercase letters/digits"><?php endif; ?>
+<label><?= $ed ? 'New PIN (leave blank to keep)' : 'PIN (4-6 digits)' ?></label><input name="pin" type="password" <?= $ed ? '' : 'required' ?>>
+<div class="btns"><button class="btn"><?= $ed ? 'Save changes' : 'Add customer' ?></button><?php if ($ed) echo '<a class="btn sec" href="customers.php">Cancel</a>'; ?></div></form></div>
+<?php page_end('admin');
+
+
+################################################################
+# FILE: admin/dashboard.php
+################################################################
+<?php
+require_once __DIR__ . '/../includes/auth.php'; require_once __DIR__ . '/../includes/layout.php'; require_once __DIR__ . '/../includes/sms.php';
+$u = require_role('admin'); $pdo = db(); $today = date('Y-m-d');
+$q = fn($sql, $p = []) => (function () use ($pdo, $sql, $p) { $s = $pdo->prepare($sql); $s->execute($p); return $s->fetchColumn(); })();
+$cust = $q("SELECT COUNT(*) FROM users WHERE role='customer'");
+$tx = $q('SELECT COUNT(*) FROM transactions WHERE created_at>=?', ["$today 00:00:00"]);
+$by = []; foreach (['sent', 'failed', 'pending'] as $s) $by[$s] = (int)$q('SELECT COUNT(*) FROM notifications WHERE status=?', [$s]);
+$fails = $pdo->query("SELECT n.*, t.transaction_ref FROM notifications n JOIN transactions t ON t.transaction_id=n.transaction_id WHERE n.status<>'sent' ORDER BY n.notification_id DESC LIMIT 5")->fetchAll();
+$max = max(1, ...array_values($by));
+page_start('Administrator dashboard', 'admin', 'dashboard'); ?>
+<div class="grid"><div class="stat"><div class="l">Customers</div><div class="v"><?= $cust ?></div></div><div class="stat"><div class="l">Transactions today</div><div class="v"><?= $tx ?></div></div>
+<div class="stat"><div class="l">Notifications sent</div><div class="v"><?= $by['sent'] ?></div></div><div class="stat"><div class="l">Failed / pending</div><div class="v"><?= $by['failed'] + $by['pending'] ?></div></div></div>
+<div class="two"><div class="card"><h2>Notifications by status</h2><div class="bars" style="margin-bottom:26px"><?php foreach ($by as $k => $v) echo '<div style="height:' . max(3, round($v / $max * 100)) . '%"><span>' . $v . '</span><em>' . $k . '</em></div>'; ?></div></div>
+<div class="card"><h2>Recent failures</h2><?php foreach ($fails as $f) echo '<p class="small">#' . $f['notification_id'] . ' ' . e($f['transaction_ref']) . ' ' . badge($f['status']) . '</p>'; if (!$fails) echo '<p class="muted">No failed or pending notifications.</p>'; ?>
+<p class="small">SMS gateway: <?= gateway_is_down() ? '<span class="badge b-failed">simulated outage</span>' : '<span class="badge b-sent">online</span>' ?> &mdash; <a href="delivery.php">manage</a></p></div></div>
+<?php page_end('admin');
+
+
+################################################################
+# FILE: admin/delivery.php
+################################################################
+<?php
+require_once __DIR__ . '/../includes/auth.php'; require_once __DIR__ . '/../includes/layout.php'; require_once __DIR__ . '/../includes/notify.php';
+$u = require_role('admin'); $pdo = db();
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    csrf_check();
+    if (($_POST['action'] ?? '') === 'retry') { [$ok, $m] = retry_notification((int)$_POST['id'], $u['user_id']); flash($m, $ok ? 'ok' : 'err'); }
+    elseif (($_POST['action'] ?? '') === 'gateway') { $down = $_POST['state'] === 'down'; set_gateway_down($down); audit($u['user_id'], 'GATEWAY', $down ? 'Simulated outage ON' : 'Gateway back online'); flash($down ? 'SMS gateway outage simulated: new SMS notifications will fail.' : 'SMS gateway is online again.'); }
+    redirect('admin/delivery.php' . (!empty($_GET['status']) ? '?status=' . urlencode($_GET['status']) : ''));
+}
+$status = in_array($_GET['status'] ?? '', ['sent', 'failed', 'pending']) ? $_GET['status'] : '';
+$cnt = []; foreach ($pdo->query('SELECT status, COUNT(*) c FROM notifications GROUP BY status') as $r) $cnt[$r['status']] = $r['c'];
+$st = $pdo->prepare('SELECT n.*, t.transaction_ref, us.full_name FROM notifications n JOIN transactions t ON t.transaction_id=n.transaction_id JOIN accounts a ON a.account_id=t.account_id JOIN users us ON us.user_id=a.user_id' . ($status ? ' WHERE n.status=?' : '') . ' ORDER BY n.notification_id DESC LIMIT 100'); $st->execute($status ? [$status] : []);
+page_start('Notification delivery monitor', 'admin', 'delivery'); ?>
+<div class="card"><form method="post" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><?= csrf_field() ?><input type="hidden" name="action" value="gateway">
+<b>SMS gateway (test facility):</b> <?= gateway_is_down() ? '<span class="badge b-failed">simulated outage</span>' : '<span class="badge b-sent">online</span>' ?>
+<input type="hidden" name="state" value="<?= gateway_is_down() ? 'up' : 'down' ?>"><button class="btn sm sec"><?= gateway_is_down() ? 'Bring gateway back online' : 'Simulate outage' ?></button></form></div>
+<div class="card"><div class="btns" style="margin:0 0 12px"><a class="btn sm <?= $status ? 'sec' : '' ?>" href="delivery.php">All</a>
+<?php foreach (['sent', 'failed', 'pending'] as $s) echo '<a class="btn sm ' . ($status === $s ? '' : 'sec') . '" href="?status=' . $s . '">' . ucfirst($s) . ' (' . ($cnt[$s] ?? 0) . ')</a>'; ?></div>
+<div class="tw"><table><tr><th>#</th><th>Customer</th><th>Reference</th><th>Message</th><th>Channel</th><th>Status</th><th>Retries</th><th></th></tr>
+<?php foreach ($st as $n): ?><tr><td><?= $n['notification_id'] ?></td><td><?= e($n['full_name']) ?></td><td class="small"><?= e($n['transaction_ref']) ?></td><td class="small"><?= e($n['message']) ?></td><td><?= e($n['channel']) ?></td><td><?= badge($n['status']) ?></td><td><?= $n['retry_count'] ?></td>
+<td><?php if ($n['status'] !== 'sent'): ?><form method="post"><?= csrf_field() ?><input type="hidden" name="action" value="retry"><input type="hidden" name="id" value="<?= $n['notification_id'] ?>"><button class="btn sm">Retry</button></form><?php else: echo '<span class="muted small">-</span>'; endif; ?></td></tr><?php endforeach; ?></table></div></div>
+<?php page_end('admin');
+
+
+################################################################
+# FILE: admin/reports.php
+################################################################
+<?php
+require_once __DIR__ . '/../includes/auth.php'; require_once __DIR__ . '/../includes/layout.php';
+$u = require_role('admin'); $pdo = db();
+$from = preg_match('/^\d{4}-\d{2}-\d{2}$/', $_GET['from'] ?? '') ? $_GET['from'] : date('Y-m-01'); $to = preg_match('/^\d{4}-\d{2}-\d{2}$/', $_GET['to'] ?? '') ? $_GET['to'] : date('Y-m-d');
+$rep = $pdo->prepare("SELECT type, direction, COUNT(*) n, SUM(amount) total FROM transactions WHERE created_at BETWEEN ? AND ? GROUP BY type, direction ORDER BY type"); $rep->execute(["$from 00:00:00", "$to 23:59:59"]); $rows = $rep->fetchAll();
+$ns = $pdo->prepare("SELECT n.status, COUNT(*) c FROM notifications n JOIN transactions t ON t.transaction_id=n.transaction_id WHERE t.created_at BETWEEN ? AND ? GROUP BY n.status"); $ns->execute(["$from 00:00:00", "$to 23:59:59"]); $nst = $ns->fetchAll(PDO::FETCH_KEY_PAIR);
+if (isset($_GET['export'])) {
+    audit($u['user_id'], 'REPORT_EXPORT', "$from to $to");
+    header('Content-Type: text/csv'); header('Content-Disposition: attachment; filename="report_' . $from . '_' . $to . '.csv"');
+    $o = fopen('php://output', 'w'); fputcsv($o, ['Type', 'Direction', 'Count', 'Total KES']); foreach ($rows as $r) fputcsv($o, [$r['type'], $r['direction'], $r['n'], $r['total']]);
+    fputcsv($o, []); foreach ($nst as $k => $v) fputcsv($o, ["Notifications $k", $v]); exit;
+}
+$logs = $pdo->query('SELECT l.*, us.username FROM audit_logs l LEFT JOIN users us ON us.user_id=l.user_id ORDER BY l.log_id DESC LIMIT 60')->fetchAll();
+page_start('Reports and audit log', 'admin', 'reports'); ?>
+<div class="card"><form class="filters"><div><label>From</label><input type="date" name="from" value="<?= e($from) ?>"></div><div><label>To</label><input type="date" name="to" value="<?= e($to) ?>"></div><div><button class="btn">Generate report</button></div><div><button class="btn sec" name="export" value="1">Export CSV</button></div></form>
+<div class="two"><div class="tw"><table><tr><th>Type</th><th>Direction</th><th class="right">Count</th><th class="right">Total (KES)</th></tr><?php foreach ($rows as $r) echo '<tr><td>' . e(ucfirst($r['type'])) . '</td><td>' . e($r['direction']) . '</td><td class="right">' . $r['n'] . '</td><td class="right">' . e(number_format($r['total'], 2)) . '</td></tr>'; if (!$rows) echo '<tr><td colspan="4" class="muted">No transactions in this period.</td></tr>'; ?></table></div>
+<div class="tw"><table><tr><th>Notification status</th><th class="right">Count</th></tr><?php foreach (['sent', 'failed', 'pending'] as $s) echo '<tr><td>' . badge($s) . '</td><td class="right">' . ($nst[$s] ?? 0) . '</td></tr>'; ?></table></div></div></div>
+<div class="card"><h2>Audit log (latest 60)</h2><div class="tw"><table><tr><th>Time</th><th>User</th><th>Action</th><th>Details</th></tr><?php foreach ($logs as $l) echo '<tr><td class="small">' . e($l['created_at']) . '</td><td>' . e($l['username'] ?? '-') . '</td><td>' . e($l['action']) . '</td><td class="small">' . e($l['details']) . '</td></tr>'; ?></table></div></div>
+<?php page_end('admin');
+
+
+################################################################
+# FILE: admin/transactions.php
+################################################################
+<?php
+require_once __DIR__ . '/../includes/auth.php'; require_once __DIR__ . '/../includes/layout.php';
+$u = require_role('admin'); $pdo = db();
+$from = $_GET['from'] ?? ''; $to = $_GET['to'] ?? ''; $acc = trim($_GET['account'] ?? ''); $ref = trim($_GET['ref'] ?? '');
+$w = '1=1'; $p = [];
+if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $from)) { $w .= ' AND t.created_at>=?'; $p[] = "$from 00:00:00"; }
+if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $to)) { $w .= ' AND t.created_at<=?'; $p[] = "$to 23:59:59"; }
+if ($acc !== '') { $w .= ' AND a.account_number=?'; $p[] = $acc; }
+if ($ref !== '') { $w .= ' AND t.transaction_ref LIKE ?'; $p[] = "%$ref%"; }
+$per = 15; $page = max(1, (int)($_GET['p'] ?? 1));
+$c = $pdo->prepare("SELECT COUNT(*) FROM transactions t JOIN accounts a ON a.account_id=t.account_id WHERE $w"); $c->execute($p); $pages = max(1, (int)ceil($c->fetchColumn() / $per));
+$st = $pdo->prepare("SELECT t.*, a.account_number, n.status AS nstatus FROM transactions t JOIN accounts a ON a.account_id=t.account_id LEFT JOIN notifications n ON n.transaction_id=t.transaction_id WHERE $w ORDER BY t.transaction_id DESC LIMIT $per OFFSET " . (($page - 1) * $per)); $st->execute($p);
+page_start('Monitor transactions', 'admin', 'transactions'); ?>
+<div class="card"><form class="filters"><div><label>From</label><input type="date" name="from" value="<?= e($from) ?>"></div><div><label>To</label><input type="date" name="to" value="<?= e($to) ?>"></div><div><label>Account</label><input name="account" value="<?= e($acc) ?>"></div><div><label>Reference</label><input name="ref" value="<?= e($ref) ?>"></div><div><button class="btn">Filter</button></div></form>
+<div class="tw"><table><tr><th>Date</th><th>Reference</th><th>Account</th><th>Type</th><th class="right">Amount</th><th class="right">Balance after</th><th>Notification</th></tr>
+<?php foreach ($st as $t): ?><tr><td><?= e($t['created_at']) ?></td><td class="small"><?= e($t['transaction_ref']) ?></td><td><?= e($t['account_number']) ?></td><td><?= e(ucfirst($t['type'])) ?> <?= badge($t['direction']) ?></td><td class="right"><?= e(number_format($t['amount'], 2)) ?></td><td class="right"><?= e(number_format($t['balance_after'], 2)) ?></td><td><?= $t['nstatus'] ? badge($t['nstatus']) : '<span class="muted">none</span>' ?></td></tr><?php endforeach; ?></table></div>
+<?= pager($page, $pages, ['from' => $from, 'to' => $to, 'account' => $acc, 'ref' => $ref]) ?></div>
+<?php page_end('admin');
+
+
+################################################################
+# FILE: includes/layout.php
+################################################################
+<?php
+function page_start(string $title, string $role, string $active): void {
+    $u = current_user(); $b = base_url();
+    $cust = ['dashboard'=>'Dashboard','transact'=>'Make a transaction','history'=>'Transactions','notifications'=>'Notifications','settings'=>'Settings','complaint'=>'Report a problem'];
+    $adm  = ['dashboard'=>'Dashboard','customers'=>'Customers','transactions'=>'Transactions','delivery'=>'Notification delivery','complaints'=>'Complaints','reports'=>'Reports & audit log'];
+    $links = $role === 'admin' ? $adm : $cust; $dir = $role === 'admin' ? 'admin' : 'customer';
+    echo '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">';
+    echo '<title>' . e($title) . ' - Mobile Banking Notifications</title><link rel="stylesheet" href="' . $b . '/assets/style.css"></head><body>';
+    echo '<div class="topbar"><div class="brand">&#9679; Real-Time Mobile Banking</div>';
+    if ($role === 'customer') {
+        echo '<nav>'; foreach ($links as $k => $v) echo '<a class="' . ($k === $active ? 'on' : '') . '" href="' . "$b/$dir/$k.php" . '">' . e($v) . '</a>'; echo '</nav>';
+    } else echo '<nav></nav>';
+    echo '<div class="who">' . e($u['full_name']) . ' (' . e($u['role']) . ') <a href="' . $b . '/logout.php">Log out</a></div></div>';
+    if ($role === 'admin') { echo '<div class="shell"><div class="side">'; foreach ($links as $k => $v) echo '<a class="' . ($k === $active ? 'on' : '') . '" href="' . "$b/$dir/$k.php" . '">' . e($v) . '</a>'; echo '</div>'; }
+    echo '<main><h1>' . e($title) . '</h1>';
+    if ($f = flash()) echo '<div class="msg ' . e($f[1]) . '">' . e($f[0]) . '</div>';
+}
+function page_end(string $role): void { echo '</main>' . ($role === 'admin' ? '</div>' : '') . '</body></html>'; }
+function badge(string $s): string { return '<span class="badge b-' . e($s) . '">' . e(str_replace('_', ' ', $s)) . '</span>'; }
+function pager(int $page, int $pages, array $q): string {
+    if ($pages <= 1) return ''; $h = '<div class="pager">';
+    for ($i = 1; $i <= $pages; $i++) { $q['p'] = $i; $h .= $i === $page ? "<span class=\"on\">$i</span>" : '<a href="?' . e(http_build_query($q)) . "\">$i</a>"; }
+    return $h . '</div>';
+}
+
+
+################################################################
+# FILE: api/balance.php
+################################################################
+<?php
+require_once __DIR__ . '/../includes/auth.php';
+$u = current_user(); header('Content-Type: application/json');
+if (!$u || $u['role'] !== 'customer') { http_response_code(401); exit('{}'); }
+$s = db()->prepare('SELECT balance FROM accounts WHERE user_id=?'); $s->execute([$u['user_id']]);
+echo json_encode(['balance' => money($s->fetchColumn())]);
+
+
+################################################################
+# FILE: assets/style.css
+################################################################
+:root{--ink:#16223a;--muted:#5d6b82;--line:#dfe5ee;--bg:#f3f6fa;--card:#fff;--brand:#0b6b57;--brand2:#0e8a70;--accent:#e8f5f1;--ok:#14794a;--okbg:#e3f6ec;--err:#b3261e;--errbg:#fdeceb;--warn:#8a5a00;--warnbg:#fff3d6}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.5 "Segoe UI",system-ui,-apple-system,Roboto,sans-serif;color:var(--ink);background:var(--bg)}
+a{color:var(--brand)}
+.topbar{background:var(--brand);color:#fff;display:flex;align-items:center;gap:18px;padding:0 20px;flex-wrap:wrap}
+.topbar .brand{font-weight:700;padding:14px 0;letter-spacing:.2px}
+.topbar nav{display:flex;gap:2px;flex-wrap:wrap;flex:1}
+.topbar nav a{color:#d8f0e9;text-decoration:none;padding:14px 12px;font-size:14px}
+.topbar nav a.on,.topbar nav a:hover{background:rgba(255,255,255,.14);color:#fff}
+.topbar .who{font-size:13px;opacity:.9}.topbar .who a{color:#fff;margin-left:10px}
+.shell{display:flex;min-height:calc(100vh - 49px)}
+.side{width:210px;background:#0d2a3a;padding:14px 0;flex:none}
+.side a{display:block;color:#c5d6e0;text-decoration:none;padding:11px 20px;font-size:14px}
+.side a.on,.side a:hover{background:#17435b;color:#fff}
+main{flex:1;padding:22px;max-width:1100px;width:100%;margin:0 auto}
+h1{font-size:22px;margin:0 0 16px}h2{font-size:16px;margin:0 0 10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:18px}
+.grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));margin-bottom:18px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px}
+.stat .l{color:var(--muted);font-size:13px}.stat .v{font-size:24px;font-weight:700;margin-top:2px}
+.balance{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;border-radius:12px;padding:22px;margin-bottom:18px}
+.balance .l{opacity:.85;font-size:13px}.balance .v{font-size:34px;font-weight:700}.balance .a{opacity:.85;font-size:13px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.3px}
+.tw{overflow-x:auto}
+label{display:block;font-weight:600;margin:12px 0 4px;font-size:14px}
+input,select,textarea{width:100%;padding:10px 11px;border:1px solid #c6cfdc;border-radius:7px;font:inherit;background:#fff}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--brand2);border-color:var(--brand2)}
+.btn{display:inline-block;background:var(--brand);color:#fff;border:0;border-radius:7px;padding:10px 18px;font:inherit;font-weight:600;cursor:pointer;text-decoration:none}
+.btn:hover{background:var(--brand2)}.btn.sec{background:#fff;color:var(--brand);border:1px solid var(--brand)}
+.btn.danger{background:var(--err)}.btn.sm{padding:5px 11px;font-size:13px}
+.btns{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px}
+.msg{padding:11px 14px;border-radius:8px;margin-bottom:16px;font-size:14px}
+.msg.ok{background:var(--okbg);color:var(--ok)}.msg.err{background:var(--errbg);color:var(--err)}
+.badge{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:600}
+.b-sent,.b-active,.b-resolved,.b-credit{background:var(--okbg);color:var(--ok)}
+.b-failed,.b-suspended,.b-open,.b-debit{background:var(--errbg);color:var(--err)}
+.b-pending,.b-in_progress{background:var(--warnbg);color:var(--warn)}
+.muted{color:var(--muted)}.small{font-size:13px}.right{text-align:right}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.filters{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:12px}.filters>div{min-width:130px;flex:1}
+.sms{background:#eef3f8;border-left:4px solid var(--brand2);padding:10px 12px;border-radius:6px;font-size:13.5px}
+.pager{display:flex;gap:6px;margin-top:12px}.pager a,.pager span{padding:5px 11px;border:1px solid var(--line);border-radius:6px;text-decoration:none;font-size:13px}.pager .on{background:var(--brand);color:#fff;border-color:var(--brand)}
+.login{max-width:400px;margin:7vh auto;padding:0 16px}
+.login .logo{text-align:center;margin-bottom:14px;color:var(--brand);font-weight:700;font-size:20px}
+.demo{font-size:12.5px;color:var(--muted);margin-top:14px;border-top:1px dashed var(--line);padding-top:10px}
+.bars{display:flex;align-items:flex-end;gap:10px;height:120px;margin-top:6px}.bars div{flex:1;background:var(--brand2);border-radius:4px 4px 0 0;position:relative;min-height:3px}
+.bars span{position:absolute;top:-18px;left:0;right:0;text-align:center;font-size:12px}.bars em{position:absolute;bottom:-20px;left:0;right:0;text-align:center;font-size:11px;color:var(--muted);font-style:normal}
+.live{display:inline-block;width:8px;height:8px;border-radius:50%;background:#7be0b9;margin-right:6px;animation:p 2s infinite}@keyframes p{50%{opacity:.3}}
+@media(max-width:760px){.topbar{display:block;padding:0 12px}.topbar .brand{padding:10px 0 4px}.topbar nav{flex-wrap:nowrap;overflow-x:auto;margin:0 -12px}.topbar nav a{white-space:nowrap;padding:10px 12px}.topbar .who{padding:6px 0 8px}.shell{display:block}.side{width:auto;display:flex;overflow-x:auto;padding:0}.side a{white-space:nowrap}.row,.two{grid-template-columns:1fr}main{padding:14px}.balance .v{font-size:28px}}
